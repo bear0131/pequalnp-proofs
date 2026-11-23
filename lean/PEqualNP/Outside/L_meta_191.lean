@@ -1,4 +1,4 @@
-import Mathlib
+import Mathlib.Data.BitVec
 import PEqualNP.Defs
 
 open PEqualNP.CircuitLowerBounds PEqualNP.MetaComplexity
@@ -219,6 +219,134 @@ private theorem fast_implies_last {ws : List T} (hf : fastTwo ws) : lastTwo ws :
     have hpair := hp x hx
     simp_all
 
+-- The value of a wire is determined by a set of older wire values.
+private def determined (S : Finset T) (z : T) : Prop :=
+  ∀ i j : Fin 32, (∀ u ∈ S, bit i u = bit j u) → bit i z = bit j z
+
+private theorem gate_sources {ws : List T} {z : T} (hz : possible ws z) :
+    ∃ S : Finset T, (∀ x ∈ S, x ∈ ws) ∧ S.card ≤ 2 ∧ determined S z := by
+  simp only [possible, Bool.or_eq_true, beq_iff_eq, List.any_eq_true] at hz
+  rcases hz with ((he | he) | ⟨x, hx, ((he | he) | ⟨y, hy, he | he⟩)⟩) <;> subst z
+  · exact ⟨∅, by simp, by simp, by simp [determined, bit]⟩
+  · refine ⟨∅, by simp, by simp, ?_⟩
+    have hall : ∀ k : Fin 32, bit k (-1) = true := by decide
+    exact fun i j _ => (hall i).trans (hall j).symm
+  · exact ⟨{x}, by simpa using hx, by simp, fun i j h => h x (by simp)⟩
+  · refine ⟨{x}, by simpa using hx, by simp, ?_⟩
+    intro i j h
+    have he := h x (by simp)
+    simpa [bit] using congrArg Bool.not he
+  · refine ⟨{x,y}, ?_, Finset.card_le_two, ?_⟩
+    · intro u hu
+      simp only [Finset.mem_insert, Finset.mem_singleton] at hu
+      rcases hu with rfl | rfl <;> assumption
+    · intro i j h
+      simpa [bit] using congrArg₂ Bool.and (h x (by simp)) (h y (by simp))
+  · refine ⟨{x,y}, ?_, Finset.card_le_two, ?_⟩
+    · intro u hu
+      simp only [Finset.mem_insert, Finset.mem_singleton] at hu
+      rcases hu with rfl | rfl <;> assumption
+    · intro i j h
+      simpa [bit] using congrArg₂ Bool.or (h x (by simp)) (h y (by simp))
+
+-- Trace a set of needed wires backwards. Replacing one new wire by its two inputs
+-- increases the number of needed wires by at most one, including when a wire is reused.
+private def blocked (n : ℕ) (ws : List T) : Prop :=
+  ∀ S : Finset T, (∀ u ∈ S, u ∈ ws) → S.card ≤ n + 1 → ¬ determined S target
+
+private theorem blocked_safe {n : ℕ} {ws : List T} (h : blocked n ws) : safe n ws := by
+  induction n generalizing ws with
+  | zero =>
+    suffices target ∉ ws by simpa [safe] using this
+    intro ht
+    exact h {target} (by simpa using ht) (by simp) (fun i j he => he target (by simp))
+  | succ n ih =>
+    intro z hz
+    apply ih
+    intro S hS hcard hdet
+    by_cases hin : z ∈ S
+    · obtain ⟨D, hD, hDC, hDz⟩ := gate_sources hz
+      let R := S.erase z ∪ D
+      apply h R
+      · intro x hx
+        rcases Finset.mem_union.mp hx with hs | hd
+        · obtain ⟨hne, hxs⟩ := Finset.mem_erase.mp hs
+          exact (List.mem_cons.mp (hS x hxs)).resolve_left hne
+        · exact hD x hd
+      · have ha := Finset.card_union_le (S.erase z) D
+        have hp : 0 < S.card := Finset.card_pos.mpr ⟨z, hin⟩
+        rw [Finset.card_erase_of_mem hin] at ha
+        dsimp [R]
+        omega
+      · intro i j he
+        apply hdet i j
+        intro x hx
+        by_cases hxe : x = z
+        · subst x
+          exact hDz i j (fun y hy => he y (Finset.mem_union_right _ hy))
+        · exact he x (Finset.mem_union_left _ (Finset.mem_erase.mpr ⟨hxe, hx⟩))
+    · apply h S _ (by omega) hdet
+      intro x hx
+      exact (List.mem_cons.mp (hS x hx)).resolve_left (fun he => hin (he ▸ hx))
+
+private abbrev Probes := Fin 5 → Fin 32 × Fin 32
+
+private def diffs (p : Probes) (u : T) : Finset (Fin 5) :=
+  Finset.univ.filter (fun i => bit (p i).1 u ≠ bit (p i).2 u)
+
+-- Four wires that each distinguish at most one of five pairs miss at least one pair.
+-- Choosing pairs that all flip the target gives a lower bound of four more gates.
+private theorem probe_blocks (p : Probes) (ws : List T)
+    (full : ∀ i, bit (p i).1 target ≠ bit (p i).2 target)
+    (light : ∀ u ∈ ws, (diffs p u).card ≤ 1) : blocked 3 ws := by
+  intro S hS hcard hdet
+  have hall : Finset.univ ⊆ S.biUnion (diffs p) := by
+    intro i _
+    by_contra hab
+    apply full i (hdet _ _ ?_)
+    intro u hu
+    by_contra hne
+    exact hab (Finset.mem_biUnion.mpr ⟨u, hu, by simpa [diffs] using hne⟩)
+  have h₁ := Finset.card_le_card hall
+  have h₂ := Finset.card_biUnion_le (s := S) (t := diffs p)
+  have h₃ : (∑ u ∈ S, (diffs p u).card) ≤ S.card := calc
+    _ ≤ ∑ _u ∈ S, 1 := Finset.sum_le_sum fun u hu => light u (hS u hu)
+    _ = _ := by simp
+  simp only [Finset.card_univ, Fintype.card_fin] at h₁
+  omega
+
+-- These six families cover all but six of the 1204 two-gate prefixes.
+private def p0 : Probes := ![(10,11), (20,22), (9,13), (18,26), (9,25)]
+private def p1 : Probes := ![(18,19), (1,3), (18,22), (5,13), (10,26)]
+private def p2 : Probes := ![(18,19), (4,6), (18,22), (18,26), (9,25)]
+private def p3 : Probes := ![(10,11), (9,11), (9,13), (4,12), (10,26)]
+private def p4 : Probes := ![(18,19), (4,6), (18,22), (5,13), (9,25)]
+private def p5 : Probes := ![(2,3), (17,19), (10,14), (18,26), (10,26)]
+
+private def samples : List Probes := [p0, p1, p2, p3, p4, p5]
+
+private def ready (p : Probes) (w : T) : Bool := decide ((diffs p w).card ≤ 1)
+
+private theorem sample_facts : samples.all (fun p =>
+    decide (∀ i, bit (p i).1 target ≠ bit (p i).2 target) && ins.all (ready p)) = true := by
+  decide +kernel
+
+private def cut (a b : T) : Bool :=
+  samples.any (fun p => ready p a && ready p b)
+
+private theorem cut_safe {a b : T} (hh : cut a b) : safe 3 (b :: a :: ins) := by
+  obtain ⟨p, hp, ha⟩ := List.any_eq_true.mp hh
+  have hf := List.all_eq_true.mp sample_facts p hp
+  simp only [Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at hf
+  simp only [Bool.and_eq_true] at ha
+  apply blocked_safe (probe_blocks p _ hf.1 ?_)
+  intro u hu
+  rcases List.mem_cons.mp hu with rfl | hu
+  · exact of_decide_eq_true ha.2
+  rcases List.mem_cons.mp hu with rfl | hu
+  · exact of_decide_eq_true ha.1
+  · exact of_decide_eq_true (hf.2 u hu)
+
 -- At a successful leaf, all five claimed tables must occur among the wires.
 private def classifies : ℕ → List T → Prop
   | 0, ws => target ∈ ws → required ⊆ ws
@@ -231,9 +359,29 @@ private theorem safe_classifies {n : ℕ} {ws : List T} (h : safe n ws) : classi
     exact fun ht => (ha ht).elim
   | succ n ih => exact fun z hz => ih (h z hz)
 
+-- With one gate left, only an old target or the new target can trigger the conclusion.
+private def finish (ws : List T) : Bool :=
+  (!ws.contains target || required.all (fun u => ws.contains u)) &&
+  (!possible ws target || required.all (fun u => (target :: ws).contains u))
+
+private theorem finish_classifies {ws : List T} (h : finish ws) : classifies 1 ws := by
+  simp only [finish, Bool.and_eq_true] at h
+  obtain ⟨hold, hnew⟩ := h
+  intro z hz ht u hu
+  rcases List.mem_cons.mp ht with he | hw
+  · subst z
+    have hall : required.all (fun v => (target :: ws).contains v) = true := by
+      simpa only [hz, Bool.not_true, Bool.false_or] using hnew
+    simpa using (List.all_eq_true.mp hall) u hu
+  · have ht' : ws.contains target = true := by simpa using hw
+    have hall : required.all (fun v => ws.contains v) = true := by
+      simpa only [ht', Bool.not_true, Bool.false_or] using hold
+    exact List.mem_cons_of_mem _ (by simpa using (List.all_eq_true.mp hall) u hu)
+
 private def search : ℕ → List T → Bool
   | 0, ws => !ws.contains target || required.all (fun u => ws.contains u)
-  | n + 1, ws => (n == 1 && fastTwo ws) || (choices ws).all (fun z => search n (z :: ws))
+  | n + 1, ws => if n = 0 then finish ws else
+      (n == 1 && fastTwo ws) || (choices ws).all (fun z => search n (z :: ws))
 
 private theorem search_classifies {n : ℕ} {ws : List T} (h : search n ws) : classifies n ws := by
   induction n generalizing ws with
@@ -241,80 +389,94 @@ private theorem search_classifies {n : ℕ} {ws : List T} (h : search n ws) : cl
     simp [search] at h
     exact fun ht => h.resolve_left (fun hn => hn ht)
   | succ n ih =>
-    simp only [search, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, List.all_eq_true] at h
+    by_cases he : n = 0
+    · subst n
+      exact finish_classifies (by exact h)
+    simp only [search, he, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, List.all_eq_true] at h
     rcases h with ⟨rfl, ht⟩ | hb
     · exact safe_classifies (lastTwo_safe (fast_implies_last ht))
     · exact fun z hz => ih (hb z ((choice_iff ws z).2 hz))
 
+
+private def fromFirst (a : T) : Bool :=
+  (choices (a :: ins)).all fun b => cut a b || search 3 (b :: a :: ins)
+
+private theorem fromFirst_classifies {a : T} (h : fromFirst a) : classifies 4 (a :: ins) := by
+  intro b hb
+  have hh := List.all_eq_true.mp h b ((choice_iff _ _).2 hb)
+  simp only [Bool.or_eq_true] at hh
+  rcases hh with hcut | hsearch
+  · exact safe_classifies (cut_safe hcut)
+  · exact search_classifies hsearch
 -- Each first gate gets its own closed check. This bounds the memory needed for reduction.
 set_option maxRecDepth 10000 in
-private theorem branch00 : search 4 (0x00000000 :: ins) = true := by decide +kernel
+private theorem branch00 : fromFirst 0x00000000 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch01 : search 4 (0xffffffff :: ins) = true := by decide +kernel
+private theorem branch01 : fromFirst 0xffffffff = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch02 : search 4 (0xaaaaaaaa :: ins) = true := by decide +kernel
+private theorem branch02 : fromFirst 0xaaaaaaaa = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch03 : search 4 (0x55555555 :: ins) = true := by decide +kernel
+private theorem branch03 : fromFirst 0x55555555 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch04 : search 4 (0x88888888 :: ins) = true := by decide +kernel
+private theorem branch04 : fromFirst 0x88888888 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch05 : search 4 (0xeeeeeeee :: ins) = true := by decide +kernel
+private theorem branch05 : fromFirst 0xeeeeeeee = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch06 : search 4 (0xa0a0a0a0 :: ins) = true := by decide +kernel
+private theorem branch06 : fromFirst 0xa0a0a0a0 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch07 : search 4 (0xfafafafa :: ins) = true := by decide +kernel
+private theorem branch07 : fromFirst 0xfafafafa = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch08 : search 4 (0xaa00aa00 :: ins) = true := by decide +kernel
+private theorem branch08 : fromFirst 0xaa00aa00 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch09 : search 4 (0xffaaffaa :: ins) = true := by decide +kernel
+private theorem branch09 : fromFirst 0xffaaffaa = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch10 : search 4 (0xaaaa0000 :: ins) = true := by decide +kernel
+private theorem branch10 : fromFirst 0xaaaa0000 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch11 : search 4 (0xffffaaaa :: ins) = true := by decide +kernel
+private theorem branch11 : fromFirst 0xffffaaaa = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch12 : search 4 (0xcccccccc :: ins) = true := by decide +kernel
+private theorem branch12 : fromFirst 0xcccccccc = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch13 : search 4 (0x33333333 :: ins) = true := by decide +kernel
+private theorem branch13 : fromFirst 0x33333333 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch14 : search 4 (0xc0c0c0c0 :: ins) = true := by decide +kernel
+private theorem branch14 : fromFirst 0xc0c0c0c0 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch15 : search 4 (0xfcfcfcfc :: ins) = true := by decide +kernel
+private theorem branch15 : fromFirst 0xfcfcfcfc = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch16 : search 4 (0xcc00cc00 :: ins) = true := by decide +kernel
+private theorem branch16 : fromFirst 0xcc00cc00 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch17 : search 4 (0xffccffcc :: ins) = true := by decide +kernel
+private theorem branch17 : fromFirst 0xffccffcc = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch18 : search 4 (0xcccc0000 :: ins) = true := by decide +kernel
+private theorem branch18 : fromFirst 0xcccc0000 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch19 : search 4 (0xffffcccc :: ins) = true := by decide +kernel
+private theorem branch19 : fromFirst 0xffffcccc = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch20 : search 4 (0xf0f0f0f0 :: ins) = true := by decide +kernel
+private theorem branch20 : fromFirst 0xf0f0f0f0 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch21 : search 4 (0x0f0f0f0f :: ins) = true := by decide +kernel
+private theorem branch21 : fromFirst 0x0f0f0f0f = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch22 : search 4 (0xf000f000 :: ins) = true := by decide +kernel
+private theorem branch22 : fromFirst 0xf000f000 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch23 : search 4 (0xfff0fff0 :: ins) = true := by decide +kernel
+private theorem branch23 : fromFirst 0xfff0fff0 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch24 : search 4 (0xf0f00000 :: ins) = true := by decide +kernel
+private theorem branch24 : fromFirst 0xf0f00000 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch25 : search 4 (0xfffff0f0 :: ins) = true := by decide +kernel
+private theorem branch25 : fromFirst 0xfffff0f0 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch26 : search 4 (0xff00ff00 :: ins) = true := by decide +kernel
+private theorem branch26 : fromFirst 0xff00ff00 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch27 : search 4 (0x00ff00ff :: ins) = true := by decide +kernel
+private theorem branch27 : fromFirst 0x00ff00ff = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch28 : search 4 (0xff000000 :: ins) = true := by decide +kernel
+private theorem branch28 : fromFirst 0xff000000 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch29 : search 4 (0xffffff00 :: ins) = true := by decide +kernel
+private theorem branch29 : fromFirst 0xffffff00 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch30 : search 4 (0xffff0000 :: ins) = true := by decide +kernel
+private theorem branch30 : fromFirst 0xffff0000 = true := by decide +kernel
 set_option maxRecDepth 10000 in
-private theorem branch31 : search 4 (0x0000ffff :: ins) = true := by decide +kernel
+private theorem branch31 : fromFirst 0x0000ffff = true := by decide +kernel
 
 private theorem five_classify : classifies 5 ins := by
   intro z hz
-  apply search_classifies
+  apply fromFirst_classifies
   have starts : choices ins = [
     0x00000000, 0xffffffff, 0xaaaaaaaa, 0x55555555, 0x88888888,
     0xeeeeeeee, 0xa0a0a0a0, 0xfafafafa, 0xaa00aa00, 0xffaaffaa,
